@@ -29,7 +29,7 @@ use crate::{
     device::AbstractDevice,
     error::{Error, Result},
     platform::freebsd::sys::*,
-    platform::posix::{self, Fd, SockAddr, Tun},
+    platform::posix::{self, sockaddr_to_rs_addr, Fd, Tun},
 };
 
 #[derive(Clone, Copy)]
@@ -86,13 +86,13 @@ impl Device {
                 return Err(Error::InvalidQueuesNumber);
             }
 
-            let ctl = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0))?;
+            let ctl = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0), true)?;
 
             let (tun, tun_name) = {
                 if let Some(name) = dev.as_ref() {
                     let device_path = format!("/dev/{}\0", name);
                     let fd = libc::open(device_path.as_ptr() as *const _, O_RDWR);
-                    let tun = Fd::new(fd).map_err(|_| io::Error::last_os_error())?;
+                    let tun = Fd::new(fd, true).map_err(|_| io::Error::last_os_error())?;
                     (tun, name.clone())
                 } else {
                     let (tun, device_name) = 'End: {
@@ -101,7 +101,8 @@ impl Device {
                             let device_path = format!("/dev/{device_name}\0");
                             let fd = libc::open(device_path.as_ptr() as *const _, O_RDWR);
                             if fd > 0 {
-                                let tun = Fd::new(fd).map_err(|_| io::Error::last_os_error())?;
+                                let tun =
+                                    Fd::new(fd, true).map_err(|_| io::Error::last_os_error())?;
                                 break 'End (tun, device_name);
                             }
                         }
@@ -164,9 +165,9 @@ impl Device {
                 self.tun_name.len(),
             );
 
-            req.addr = SockAddr::from(addr).into();
-            req.dstaddr = SockAddr::from(dest).into();
-            req.mask = SockAddr::from(mask).into();
+            req.addr = posix::rs_addr_to_sockaddr((addr, 0).into()).addr;
+            req.dstaddr = posix::rs_addr_to_sockaddr((dest, 0).into()).addr;
+            req.mask = posix::rs_addr_to_sockaddr((mask, 0).into()).addr;
 
             if let Err(err) = siocaifaddr(ctl.as_raw_fd(), &req) {
                 return Err(io::Error::from(err).into());
@@ -321,14 +322,11 @@ impl AbstractDevice for Device {
     fn address(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_addr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_addr as *const _ as *const posix::sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
@@ -351,14 +349,11 @@ impl AbstractDevice for Device {
     fn destination(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifdstaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_dstaddr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_dstaddr as *const _ as *const posix::sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
@@ -381,14 +376,11 @@ impl AbstractDevice for Device {
     fn broadcast(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifbrdaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_broadaddr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_broadaddr as *const _ as *const posix::sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
@@ -399,14 +391,12 @@ impl AbstractDevice for Device {
     fn netmask(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifnetmask(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_addr).map(Into::into)?,
-            ))
+            // NOTE: Here should be `ifru_netmask` instead of `ifru_addr`, but `ifreq` does not define it.
+            let sa = &req.ifr_ifru.ifru_addr as *const _ as *const posix::sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 

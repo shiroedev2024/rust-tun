@@ -30,8 +30,10 @@ use crate::{
     device::AbstractDevice,
     error::{Error, Result},
     platform::linux::sys::*,
-    platform::posix::{self, Fd, SockAddr, Tun},
+    platform::posix::{self, ipaddr_to_sockaddr, sockaddr_to_rs_addr, sockaddr_union, Fd, Tun},
 };
+
+const OVERWRITE_SIZE: usize = std::mem::size_of::<libc::__c_anonymous_ifr_ifru>();
 
 /// A TUN device using the TUN/TAP Linux driver.
 pub struct Device {
@@ -56,7 +58,11 @@ impl Device {
     /// Create a new `Device` for the given `Configuration`.
     pub fn new(config: &Configuration) -> Result<Self> {
         let mut device = unsafe {
-            let dev = match config.tun_name.as_ref() {
+            if config.raw_fd.is_some() {
+                // TODO: Should we support this in the future?
+                return Err(Error::NotImplemented);
+            }
+            let dev_name = match config.tun_name.as_ref() {
                 Some(tun_name) => {
                     let tun_name = CString::new(tun_name.clone())?;
 
@@ -72,11 +78,11 @@ impl Device {
 
             let mut req: ifreq = mem::zeroed();
 
-            if let Some(dev) = dev.as_ref() {
+            if let Some(dev_name) = dev_name.as_ref() {
                 ptr::copy_nonoverlapping(
-                    dev.as_ptr() as *const c_char,
+                    dev_name.as_ptr() as *const c_char,
                     req.ifr_name.as_mut_ptr(),
-                    dev.as_bytes().len(),
+                    dev_name.as_bytes_with_nul().len(),
                 );
             }
 
@@ -94,27 +100,27 @@ impl Device {
                 | if packet_information { 0 } else { iff_no_pi }
                 | if queues_num > 1 { iff_multi_queue } else { 0 };
 
-            let tun = {
+            let tun_fd = {
                 let fd = libc::open(b"/dev/net/tun\0".as_ptr() as *const _, O_RDWR);
-                let tun = Fd::new(fd).map_err(|_| io::Error::last_os_error())?;
+                let tun_fd = Fd::new(fd, true).map_err(|_| io::Error::last_os_error())?;
 
-                if let Err(err) = tunsetiff(tun.0, &mut req as *mut _ as *mut _) {
+                if let Err(err) = tunsetiff(tun_fd.inner, &mut req as *mut _ as *mut _) {
                     return Err(io::Error::from(err).into());
                 }
 
-                tun
+                tun_fd
             };
 
             let mtu = config.mtu.unwrap_or(crate::DEFAULT_MTU);
 
-            let ctl = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0))?;
+            let ctl = Fd::new(libc::socket(AF_INET, SOCK_DGRAM, 0), true)?;
 
             let tun_name = CStr::from_ptr(req.ifr_name.as_ptr())
                 .to_string_lossy()
                 .to_string();
             Device {
                 tun_name,
-                tun: Tun::new(tun, mtu, packet_information),
+                tun: Tun::new(tun_fd, mtu, packet_information),
                 ctl,
             }
         };
@@ -261,29 +267,21 @@ impl AbstractDevice for Device {
     fn address(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_addr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_addr as *const _ as *const sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
     fn set_address(&mut self, value: IpAddr) -> Result<()> {
-        let IpAddr::V4(value) = value else {
-            unimplemented!("do not support IPv6 yet")
-        };
         unsafe {
             let mut req = self.request();
-            req.ifr_ifru.ifru_addr = SockAddr::from(value).into();
-
+            ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_addr, OVERWRITE_SIZE);
             if let Err(err) = siocsifaddr(self.ctl.as_raw_fd(), &req) {
                 return Err(io::Error::from(err).into());
             }
-
             Ok(())
         }
     }
@@ -291,29 +289,21 @@ impl AbstractDevice for Device {
     fn destination(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifdstaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_dstaddr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_dstaddr as *const _ as *const sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
     fn set_destination(&mut self, value: IpAddr) -> Result<()> {
-        let IpAddr::V4(value) = value else {
-            unimplemented!("do not support IPv6 yet")
-        };
         unsafe {
             let mut req = self.request();
-            req.ifr_ifru.ifru_dstaddr = SockAddr::from(value).into();
-
+            ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_dstaddr, OVERWRITE_SIZE);
             if let Err(err) = siocsifdstaddr(self.ctl.as_raw_fd(), &req) {
                 return Err(io::Error::from(err).into());
             }
-
             Ok(())
         }
     }
@@ -321,29 +311,21 @@ impl AbstractDevice for Device {
     fn broadcast(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifbrdaddr(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_broadaddr).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_broadaddr as *const _ as *const sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
     fn set_broadcast(&mut self, value: IpAddr) -> Result<()> {
-        let IpAddr::V4(value) = value else {
-            unimplemented!("do not support IPv6 yet")
-        };
         unsafe {
             let mut req = self.request();
-            req.ifr_ifru.ifru_broadaddr = SockAddr::from(value).into();
-
+            ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_broadaddr, OVERWRITE_SIZE);
             if let Err(err) = siocsifbrdaddr(self.ctl.as_raw_fd(), &req) {
                 return Err(io::Error::from(err).into());
             }
-
             Ok(())
         }
     }
@@ -351,29 +333,21 @@ impl AbstractDevice for Device {
     fn netmask(&self) -> Result<IpAddr> {
         unsafe {
             let mut req = self.request();
-
             if let Err(err) = siocgifnetmask(self.ctl.as_raw_fd(), &mut req) {
                 return Err(io::Error::from(err).into());
             }
-
-            Ok(IpAddr::V4(
-                SockAddr::new(&req.ifr_ifru.ifru_netmask).map(Into::into)?,
-            ))
+            let sa = &req.ifr_ifru.ifru_netmask as *const _ as *const sockaddr_union;
+            Ok(sockaddr_to_rs_addr(&*sa).ok_or(Error::InvalidAddress)?.ip())
         }
     }
 
     fn set_netmask(&mut self, value: IpAddr) -> Result<()> {
-        let IpAddr::V4(value) = value else {
-            unimplemented!("do not support IPv6 yet")
-        };
         unsafe {
             let mut req = self.request();
-            req.ifr_ifru.ifru_netmask = SockAddr::from(value).into();
-
+            ipaddr_to_sockaddr(value, 0, &mut req.ifr_ifru.ifru_netmask, OVERWRITE_SIZE);
             if let Err(err) = siocsifnetmask(self.ctl.as_raw_fd(), &req) {
                 return Err(io::Error::from(err).into());
             }
-
             Ok(())
         }
     }
